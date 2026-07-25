@@ -198,8 +198,8 @@ void init_loadCustomEnv() {
 ///
 /// 渲染器与 MobileGlues 的关系（重要）：
 /// - MobileGlues 渲染器（libmobileglues.dylib）：直接加载 MobileGlues，config.json 生效。
-/// - Auto 渲染器：在 launchJVM 中被解析为 ANGLE（libtinygl4angle.dylib），MobileGlues 不会被加载，
-///   config.json 虽然会写入但不会被读取。用户需显式选择 MobileGlues 渲染器才能让设置生效。
+/// - Auto 渲染器：MC 1.21.5+ 的 1.x 版本会解析为 MobileGlues，以避开 ANGLE 的
+///   GUI shader 黑屏；其他版本仍按原策略解析为 ANGLE。
 /// - Vulkan 渲染器：Vulkan 模式下 OpenGL 回退库使用 MobileGlues（对齐 Ynnyny 仓库），
 ///   config.json 会被 MobileGlues 读取并生效。
 void init_loadMobileGluesConfig() {
@@ -215,11 +215,8 @@ void init_loadMobileGluesConfig() {
         return;
     }
 
-    // 警告：auto 渲染器实际不会加载 MobileGlues，设置不会生效
     if ([renderer isEqualToString:@"auto"]) {
-        NSLog(@"[JavaLauncher] WARNING: renderer is 'auto', will be resolved to ANGLE. "
-              @"MobileGlues settings will NOT take effect. "
-              @"Please explicitly select 'MobileGlues' renderer to use these settings.");
+        NSLog(@"[JavaLauncher] Auto renderer detected; MobileGlues config prepared for version-aware fallback.");
     } else if ([renderer isEqualToString:@ RENDERER_NAME_VULKAN]) {
         NSLog(@"[JavaLauncher] Vulkan renderer detected, MobileGlues used as GL fallback. Config will take effect.");
     } else {
@@ -851,15 +848,21 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     const char *glLibName = getenv("AMETHYST_RENDERER");
     if (glLibName) {
         if (!strcmp(glLibName, "auto")) {
-            // 关键修复（26.2 启动崩溃）：Auto 渲染器始终选 ANGLE（对齐 Ynnyny 仓库）
-            //
-            // 之前 workspace 在 Java 21+ 优先选 MobileGlues，但 Ynnyny 仓库用 ANGLE 就能正常启动 26.2。
-            // workspace 选 MobileGlues 后又缺少 init_loadMobileGluesConfig() 写 config.json，
-            // 导致 MobileGlues 用不安全默认值初始化 GL 上下文可能崩溃。现对齐 Ynnyny 始终选 ANGLE。
-            // MobileGlues 仍保留为手动选项（用户可在设置中显式选择）。
-            glLibName = RENDERER_NAME_MTL_ANGLE;
+            NSString *rendererVersionId = [launchTarget isKindOfClass:NSDictionary.class]
+                ? launchTarget[@"id"] : nil;
+            BOOL isModernOneDotRelease = [rendererVersionId hasPrefix:@"1."]
+                && [rendererVersionId compare:@"1.21.5" options:NSNumericSearch] != NSOrderedAscending;
+
+            // ANGLE's tinygl4angle wrapper cannot compile the GUI shader format
+            // introduced in 1.21.5, resulting in an all-black first frame.
+            // Keep the ANGLE workaround for 26.x, but restore MobileGlues for
+            // modern 1.x releases where its GLSL conversion path is required.
+            glLibName = isModernOneDotRelease
+                ? RENDERER_NAME_MOBILEGLUES
+                : RENDERER_NAME_MTL_ANGLE;
             setenv("AMETHYST_RENDERER", glLibName, 1);
-            NSLog(@"[JavaLauncher] Auto renderer resolved to %s (always ANGLE)", glLibName);
+            NSLog(@"[JavaLauncher] Auto renderer resolved to %s for Minecraft %@",
+                  glLibName, rendererVersionId ?: @"<unknown>");
         }
         if (strcmp(glLibName, RENDERER_NAME_VULKAN) == 0) {
             // 对齐 Ynnyny 仓库：Vulkan 模式下 OpenGL 回退库使用 MobileGlues
