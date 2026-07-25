@@ -4009,12 +4009,18 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
                                                                     type:InlineMessageTypeLoading];
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        while (!isJITEnabled(false)) {
-            usleep(1000 * 200);
-        }
+        BOOL jitEnabled = waitForJITEnabled(60.0);
         dispatch_async(dispatch_get_main_queue(), ^{
             [jitAlert dismiss];
-            if (handler) handler();
+            if (jitEnabled) {
+                [ALTServerManager.sharedManager stopDiscovering];
+                if (handler) handler();
+                return;
+            }
+            NSString *diagnostic = JITStatusDiagnostic();
+            NSLog(@"[JIT] Timed out while waiting: %@", diagnostic);
+            showDialog(localize(@"Error", nil),
+                [NSString stringWithFormat:@"等待 JIT 超时，请确认调试器仍保持连接后重试。\n\n%@", diagnostic]);
         });
     });
 }

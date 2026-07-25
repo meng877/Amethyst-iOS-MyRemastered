@@ -45,6 +45,30 @@ BOOL isJITEnabled(BOOL checkCSFlags) {
     return JIT26IsLikelyDebuggerKeepAttached();
 }
 
+BOOL waitForJITEnabled(NSTimeInterval timeout) {
+    NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + MAX(timeout, 0);
+    do {
+        if (isJITEnabled(NO)) {
+            return YES;
+        }
+        usleep(1000 * 200);
+    } while (NSProcessInfo.processInfo.systemUptime < deadline);
+    return isJITEnabled(NO);
+}
+
+NSString *JITStatusDiagnostic(void) {
+    int csFlags = 0;
+    int csopsResult = csops(getpid(), 0, &csFlags, sizeof(csFlags));
+    JITFlags jitFlags = DeviceGetJITFlags(NO);
+    return [NSString stringWithFormat:
+        @"JIT flags=0x%X, csops=%d, CS_DEBUGGED=%@, parent=%d, debugger=%@",
+        jitFlags,
+        csopsResult,
+        (csFlags & CS_DEBUGGED) ? @"YES" : @"NO",
+        getppid(),
+        JIT26IsLikelyDebuggerKeepAttached() ? @"attached" : @"detached"];
+}
+
 
 void openLink(UIViewController* sender, NSURL* link) {
     if (NSClassFromString(@"SFSafariViewController") == nil) {
@@ -274,17 +298,29 @@ JITFlags DeviceGetJITFlags(BOOL refresh) {
         }
 
         cachedFlags = 0;
+        BOOL isIOS26OrLater = NO;
+        BOOL canCreateRXMap = NO;
+        BOOL hasTXM = DeviceHasTXMReal();
         if (@available(iOS 26.0, *)) {
+            isIOS26OrLater = YES;
             cachedFlags |= JIT_FLAG_IS_IOS_26;
-            if (!DeviceCanCreateRXMap()) {
+            canCreateRXMap = DeviceCanCreateRXMap();
+            // The RX probe becomes successful after JIT is attached, even on a
+            // physical TXM device. TXM devices must keep using UniversalJIT26's
+            // mirrored-memory path after the flags are refreshed by launchJVM.
+            if (hasTXM || !canCreateRXMap) {
                 cachedFlags |= JIT_FLAG_FORCE_MIRRORED;
             }
         }
-        if (DeviceHasTXMReal()) {
+        if (hasTXM) {
             cachedFlags |= JIT_FLAG_HAS_TXM;
         }
         if (refresh) {
-            NSLog(@"[JIT] Using computed JIT flags: 0x%X", cachedFlags);
+            NSLog(@"[JIT] Device probe: iOS26+=%@, TXM=%@, RX=%@, flags=0x%X",
+                  isIOS26OrLater ? @"YES" : @"NO",
+                  hasTXM ? @"YES" : @"NO",
+                  canCreateRXMap ? @"YES" : @"NO",
+                  cachedFlags);
         }
     });
     return cachedFlags;

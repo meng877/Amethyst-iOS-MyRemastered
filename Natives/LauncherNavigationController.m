@@ -691,12 +691,19 @@ static void *ProgressObserverContext = &ProgressObserverContext;
     [self presentViewController:alert animated:YES completion:nil];
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        while (!isJITEnabled(false)) {
-            // Perform check for every 200ms
-            usleep(1000*200);
-        }
+        BOOL jitEnabled = waitForJITEnabled(60.0);
         dispatch_async(dispatch_get_main_queue(), ^{
-            [alert dismissViewControllerAnimated:YES completion:handler];
+            [alert dismissViewControllerAnimated:YES completion:^{
+                if (jitEnabled) {
+                    [ALTServerManager.sharedManager stopDiscovering];
+                    handler();
+                    return;
+                }
+                NSString *diagnostic = JITStatusDiagnostic();
+                NSLog(@"[JIT] Timed out while waiting: %@", diagnostic);
+                showDialog(localize(@"Error", nil),
+                    [NSString stringWithFormat:@"等待 JIT 超时，请确认调试器仍保持连接后重试。\n\n%@", diagnostic]);
+            }];
         });
     });
 }

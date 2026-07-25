@@ -66,6 +66,8 @@ BOOL debugLogEnabled, isJailbroken;
 #define CS_DEBUGGED 0x10000000
 int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 BOOL isJITEnabled(BOOL checkCSOps);
+BOOL waitForJITEnabled(NSTimeInterval timeout);
+NSString *JITStatusDiagnostic(void);
 // Legacy breakpoint used only to verify that the Universal JIT script is active.
 void* JIT26CreateRegionLegacy(size_t len);
 // used for large memory regions
