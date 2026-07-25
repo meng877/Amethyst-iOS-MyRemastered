@@ -28,6 +28,7 @@
 - [核心特性](#核心特性)
 - [快速上手](#快速上手)
   - [设备要求](#设备要求)
+  - [iOS 26.4+ JIT 注意事项](#ios-264-jit-注意事项)
   - [侧载准备](#侧载准备)
   - [安装步骤](#安装步骤)
   - [启用 JIT](#启用-jit)
@@ -45,6 +46,7 @@
 - **账户限制解除** -- 支持本地账户、演示模式和第三方认证，无需 Microsoft 账户即可下载和游玩。
 - **多账户支持** -- 在 Microsoft 账户、本地账户和第三方认证账户之间无缝切换。
 - **自动渲染器选择** -- 设为 Auto 时自动选择最优渲染后端（含 MobileGlues、MoltenVK 等渲染器）。
+- **iOS 26.4+ Universal JIT** -- 使用 Amethyst 当前的 Universal JIT 脚本、设备能力自动检测及 TXM/非 TXM 专用内存处理。
 - **适配 Minecraft 26.X** -- 添加 Minecraft 26.X 支持（实验性）
 - **自定义鼠标指针** -- 在设置中自定义虚拟鼠标指针皮肤。
 - **TouchController 支持** -- 通过 UDP 和 XCFramework 两种通信方式与 TouchController Mod 通信，为 iOS 提供完整的触屏控制。
@@ -68,7 +70,20 @@
 | **推荐配置** | iOS 14.5+ | iPhone XS+（不含 XR/SE 2 代）、iPad 10 代+、iPad Air 4 代+、iPad mini 6 代+、iPad Pro（不含 9.7 英寸） |
 
 > [!CAUTION]
-> iOS 14.0--14.4.2 存在已知的严重兼容性问题，**强烈建议升级至 iOS 14.5 或更高版本。** iOS 17.x 和 18.x 受支持，但首次配置 JIT 需要电脑辅助（参见[官方 JIT 指南](https://wiki.angelauramc.dev/wiki/faq/ios/JIT.html#what-are-the-methods-to-enable-jit)）。iOS 26.x 可安装使用，但未经过专项适配，可能出现不可预测的问题。
+> iOS 14.0--14.4.2 存在已知的严重兼容性问题，**强烈建议升级至 iOS 14.5 或更高版本。** iOS 17.x 和 18.x 受支持，但首次配置 JIT 需要电脑辅助（参见[官方 JIT 指南](https://wiki.angelauramc.dev/wiki/faq/ios/JIT.html#what-are-the-methods-to-enable-jit)）。基于提交 `979ac18` 或更新提交的 Nightly 构建已包含 iOS 26.4+ 新版 JIT 适配；由于 JIT 可用性仍取决于安装方式、设备及调试工具，建议进行真机测试。
+
+### iOS 26.4+ JIT 注意事项
+
+启动器现已采用上游 Amethyst 的 Universal JIT 工作流：
+
+- Air 会自动检测设备是否需要镜像可执行内存，以及是否需要 Trusted Execution Monitor（TXM）兼容处理。
+- 在 iOS 17.4 或更高版本上启动游戏时，Air 会通过 URL Scheme 自动打开 StikDebug；对于受影响的 iOS 26 设备，还会自动传递内置的 `UniversalJIT26.js` 脚本。
+- 请保持 Air 和 StikDebug 运行，直到“等待 JIT”提示消失。启用 **设置 → 调试 → 保持连接到 StikDebug** 后，游戏运行期间不要关闭 StikDebug 的画中画窗口。
+- 如果出现旧版脚本警告，请在 StikDebug 中为 Air 分配“文件”应用内 Air 文稿目录中的 `UniversalJIT26.js`。部分侧载版 StikDebug 将同一脚本命名为 `Amethyst-MeloNX.js`。LiveContainer 会自动更新脚本，按提示重启即可。
+- **保持连接到 StikDebug** 通常无需启用；仅当 Mod 或依赖需要在游戏运行期间继续加载未签名 `.dylib` 时才启用。
+
+> [!IMPORTANT]
+> 本次更新适配的是启动器内部的 JIT 与可执行内存处理，并不能自行提供 JIT。仍需使用兼容的 TrollStore、StikDebug、SideStore、AltStore、越狱环境或开发调试环境。
 
 ### 侧载准备
 
@@ -115,9 +130,11 @@ JIT（即时编译）是流畅运行游戏的关键。请根据自身环境选�
 | TrollStore | 否 | 否 | 是 | 首选方案，无需额外操作 |
 | AltStore | 是 | 是 | 是 | 需本地网络运行 AltServer |
 | SideStore | 仅首次 | 仅首次 | 否 | 初始设置后无需设备/网络 |
-| StikDebug | 仅首次 | 仅首次 | 是 | 初始设置后无需设备/网络 |
+| StikDebug | 仅首次 | 仅首次 | 是 | Air 自动唤起；受影响的 iOS 26.4+ 设备使用 Universal JIT |
 | Jitterbug | 是（无 VPN 时） | 是 | 否 | 需手动触发 |
 | 已越狱设备 | 否 | 否 | 是 | 系统级自动支持 |
+
+iOS 26.4 及更高版本如遇启动失败，请先阅读 [iOS 26.4+ JIT 注意事项](#ios-264-jit-注意事项)。
 
 ## 贡献者
 

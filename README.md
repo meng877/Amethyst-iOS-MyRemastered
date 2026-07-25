@@ -28,6 +28,7 @@ A premium Minecraft: Java Edition launcher for iOS and iPadOS, rebuilt from the 
 - [Core Features](#core-features)
 - [Quick Start](#quick-start)
   - [Device Requirements](#device-requirements)
+  - [iOS 26.4+ JIT Notes](#ios-264-jit-notes)
   - [Sideload Preparation](#sideload-preparation)
   - [Installation](#installation)
   - [Enabling JIT](#enabling-jit)
@@ -46,6 +47,7 @@ A premium Minecraft: Java Edition launcher for iOS and iPadOS, rebuilt from the 
 - **Multi-Account** -- Seamlessly switch between Microsoft, local, and third-party authentication accounts.
 - **Auto Renderer Selection** -- Automatically chooses the optimal rendering backend (including MobileGlues, MoltenVK, and more) when set to Auto.
 - **Auto JVM Selection** -- Automatically selects the correct JVM version (Java 8, 17, 21, or 25) based on the game version.
+- **iOS 26.4+ Universal JIT** -- Uses Amethyst's current Universal JIT script, automatic device capability detection, and dedicated TXM/non-TXM memory handling.
 - **Minecraft 26.X Support** -- Experimental support for Minecraft 26.x.
 - **Custom Mouse Pointer** -- Customize the virtual mouse pointer skin in settings.
 - **Custom News URL** -- Configure a custom news feed URL for the launcher home screen.
@@ -70,7 +72,20 @@ For complete documentation, refer to the [Amethyst Official Wiki](https://wiki.a
 | **Recommended** | iOS 14.5+ | iPhone XS+ (excl. XR/SE 2nd gen), iPad 10th gen+, iPad Air 4th gen+, iPad mini 6th gen+, iPad Pro (excl. 9.7-inch) |
 
 > [!CAUTION]
-> iOS 14.0--14.4.2 has known critical compatibility issues. **Upgrading to iOS 14.5 or later is strongly recommended.** iOS 17.x and 18.x are supported but require a companion computer for initial JIT configuration (see the [Official JIT Guide](https://wiki.angelauramc.dev/wiki/faq/ios/JIT.html#what-are-the-methods-to-enable-jit)). iOS 26.x is installable but has not undergone dedicated adaptation; expect unpredictable behavior.
+> iOS 14.0--14.4.2 has known critical compatibility issues. **Upgrading to iOS 14.5 or later is strongly recommended.** iOS 17.x and 18.x are supported but require a companion computer for initial JIT configuration (see the [Official JIT Guide](https://wiki.angelauramc.dev/wiki/faq/ios/JIT.html#what-are-the-methods-to-enable-jit)). Nightly builds based on commit `979ac18` or later include the new iOS 26.4+ JIT path. Device-side testing is still recommended because JIT availability depends on the installation and debugging tool.
+
+### iOS 26.4+ JIT Notes
+
+The launcher now follows upstream Amethyst's Universal JIT workflow:
+
+- Air automatically detects whether the device requires mirrored executable memory and whether Trusted Execution Monitor (TXM) handling is needed.
+- On iOS 17.4 or later, starting the game automatically opens StikDebug through its URL scheme. On affected iOS 26 devices, the launcher also passes the bundled `UniversalJIT26.js` script.
+- Keep Air and StikDebug running until the “Waiting for JIT” message disappears. Do not close StikDebug's Picture-in-Picture window when **Settings → Debug → Keep attached to StikDebug** is enabled.
+- If a legacy-script warning appears, assign `UniversalJIT26.js` from Air's Documents directory in StikDebug. Sideloaded StikDebug builds may provide the same script as `Amethyst-MeloNX.js`. LiveContainer installations are updated automatically and only need to be restarted.
+- The **Keep attached to StikDebug** option is normally unnecessary. Enable it only when a mod or library must load additional unsigned `.dylib` files while the game is running.
+
+> [!IMPORTANT]
+> This update adapts the launcher's JIT and executable-memory handling; it does not provide JIT by itself. A compatible TrollStore, StikDebug, SideStore, AltStore, jailbreak, or development-debugging environment is still required.
 
 ### Sideload Preparation
 
@@ -117,9 +132,11 @@ JIT (Just-In-Time compilation) is essential for smooth gameplay. Choose the appr
 | TrollStore | No | No | Yes | Preferred; no additional action needed |
 | AltStore | Yes | Yes | Yes | Requires AltServer running on local network |
 | SideStore | First time only | First time only | No | Device/network-free after initial setup |
-| StikDebug | First time only | First time only | Yes | Device/network-free after initial setup |
+| StikDebug | First time only | First time only | Yes | Auto-opened by Air; uses Universal JIT on affected iOS 26.4+ devices |
 | Jitterbug | Yes (without VPN) | Yes | No | Manual trigger required |
 | Jailbroken | No | No | Yes | System-level automatic support |
+
+For iOS 26.4 and later, read the [iOS 26.4+ JIT notes](#ios-264-jit-notes) before troubleshooting launch failures.
 
 ## Contributors
 
