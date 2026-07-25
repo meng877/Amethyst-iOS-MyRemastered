@@ -3,9 +3,17 @@
 #import "SurfaceViewController.h"
 #import "ios_uikit_bridge.h"
 #import "utils.h"
+#import "mach_excServer.h"
 
 #include "external/fishhook/fishhook.h"
+#include <assert.h>
 #include <dlfcn.h>
+#include <libgen.h>
+#include <pthread.h>
+
+mach_port_t excPort;
+void *hooked_dlopen_26_ppl(const char *path, int mode);
+void rebindZinkStrideFixForNewImage(void);
 
 void (*orig_abort)();
 void (*orig_exit)(int code);
@@ -203,43 +211,154 @@ void hooked_exit(int code) {
     orig_exit(code);
 }
 
-void* hooked_dlopen(const char* path, int mode) {
-    const char *home = getenv("HOME");
-    // Only proceed to check if dylib is in the home dir
-    char fullpath[PATH_MAX];
-    if (!path || !realpath(path, fullpath) || !strstr(fullpath, home)) {
-        // 即使 path 不在 home 目录，也检查是否是 libSDL3.dylib
-        // MC 26.3-snapshot-4+ 加载 libSDL3.dylib 后，需要立即对 SDL_CreateWindow
-        // 进行 fishhook 符号重绑定（dlsym hook 对 MC 的 SDL3 调用方式无效）
-        void *handle = orig_dlopen(path, mode);
-        if (handle && path && strstr(path, "libSDL3")) {
-            NSLog(@"[SDL3 Hook] libSDL3.dylib loaded via dlopen, rebinding SDL_CreateWindow via fishhook");
-            // 重新注册所有 hook，包括 SDL_CreateWindow
-            init_hookFunctions();
-        }
-        // Zink stride fix：libOSMesa 加载后重新执行 fishhook，捕获其对
-        // vkGetInstanceProcAddr / vkGetDeviceProcAddr 的符号引用
-        // （installZinkStrideFix 在 libOSMesa 加载前调用，初次 rebind 无法
-        //  捕获 libOSMesa image 内的引用；必须在其加载后再次 rebind）
-        if (handle && path && strstr(path, "libOSMesa") && g_zinkStrideFixActive) {
-            NSLog(@"[ZinkStrideFix] libOSMesa loaded via dlopen, re-rebinding Vulkan symbols");
-            rebindZinkStrideFixForNewImage();
-        }
-        return handle;
+static void handleLoadedLibrary(const char *path, void *handle) {
+    if (!handle || !path) {
+        return;
     }
-
-    PLPatchMachOPlatformForFile(path);
-    void *handle = orig_dlopen(path, mode);
-    if (handle && path && strstr(path, "libSDL3")) {
-        NSLog(@"[SDL3 Hook] libSDL3.dylib loaded via dlopen (home), rebinding SDL_CreateWindow via fishhook");
+    if (strstr(path, "libSDL3")) {
+        NSLog(@"[SDL3 Hook] libSDL3.dylib loaded, rebinding SDL symbols");
         init_hookFunctions();
     }
-    if (handle && path && strstr(path, "libOSMesa") && g_zinkStrideFixActive) {
-        NSLog(@"[ZinkStrideFix] libOSMesa loaded via dlopen (home), re-rebinding Vulkan symbols");
+    if (strstr(path, "libOSMesa") && g_zinkStrideFixActive) {
+        NSLog(@"[ZinkStrideFix] libOSMesa loaded, re-rebinding Vulkan symbols");
         rebindZinkStrideFixForNewImage();
     }
+}
+
+void* hooked_dlopen(const char* path, int mode) {
+    BOOL shouldUseHardwareBreakpointBypass =
+        DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED) &&
+        !DeviceHasJITFlags(JIT_FLAG_HAS_TXM) &&
+        hwRedirectOrig[0];
+
+    const char *home = getenv("HOME");
+    const char *tmp = getenv("TMPDIR");
+    char fullpath[PATH_MAX];
+    BOOL shouldUseDyldBypass = path && realpath(path, fullpath) &&
+        ((home && strstr(fullpath, home)) || (tmp && strstr(fullpath, tmp)));
+    shouldUseHardwareBreakpointBypass &= shouldUseDyldBypass;
+
+    if (shouldUseDyldBypass) {
+        PLPatchMachOPlatformForFile(path);
+    }
+    if (shouldUseHardwareBreakpointBypass) {
+        __attribute__((musttail)) return hooked_dlopen_26_ppl(path, mode);
+    }
+
+    void *handle;
+    if (shouldUseDyldBypass) {
+        // LiveContainer multitask mode hooks dlopen/mmap; call the system
+        // implementation so Amethyst's dyld bypass remains in control.
+        static void *(*sys_dlopen)(const char *, int);
+        if (!sys_dlopen) {
+            sys_dlopen = dlsym(RTLD_NEXT, "dlopen");
+        }
+        handle = sys_dlopen(path, mode);
+    } else {
+        handle = orig_dlopen(path, mode);
+    }
+    handleLoadedLibrary(path, handle);
     return handle;
 }
+
+// Hardware-breakpoint dyld redirection for non-TXM iOS 26 devices.
+static void *jit26ExceptionServer(void *unused) {
+    mach_msg_server(mach_exc_server,
+                    sizeof(union __RequestUnion__catch_mach_exc_subsystem),
+                    excPort, MACH_MSG_OPTION_NONE);
+    abort();
+}
+
+void *hooked_dlopen_26_ppl(const char *path, int mode) {
+    if (!excPort) {
+        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &excPort);
+        mach_port_insert_right(mach_task_self(), excPort, excPort,
+                               MACH_MSG_TYPE_MAKE_SEND);
+        pthread_t serverThread;
+        pthread_create(&serverThread, NULL, jit26ExceptionServer, NULL);
+    }
+
+    exception_mask_t mask = EXC_MASK_BREAKPOINT;
+    mach_msg_type_number_t masksCount = 1;
+    exception_handler_t handler = excPort;
+    exception_behavior_t behavior = EXCEPTION_STATE | MACH_EXCEPTION_CODES;
+    thread_state_flavor_t flavor = ARM_THREAD_STATE64;
+    arm_debug_state64_t originalDebugState;
+    mach_port_t thread = mach_thread_self();
+    mach_msg_type_number_t debugStateCount = ARM_DEBUG_STATE64_COUNT;
+    thread_get_state(thread, ARM_DEBUG_STATE64,
+                     (thread_state_t)&originalDebugState, &debugStateCount);
+    thread_swap_exception_ports(thread, mask, handler, behavior, flavor,
+                                &mask, &masksCount, &handler, &behavior, &flavor);
+    assert(masksCount == 1);
+
+    arm_debug_state64_t hookDebugState = {0};
+    for (int i = 0; i < 6 && hwRedirectOrig[i]; i++) {
+        hookDebugState.__bvr[i] = hwRedirectOrig[i];
+        hookDebugState.__bcr[i] = 0x1e5;
+    }
+    thread_set_state(thread, ARM_DEBUG_STATE64,
+                     (thread_state_t)&hookDebugState, ARM_DEBUG_STATE64_COUNT);
+
+    void *result;
+    void *callerAddress = __builtin_return_address(0);
+    struct dl_info info;
+    if (path && !strncmp(path, "@loader_path/", 13) &&
+        dladdr(callerAddress, &info)) {
+        char resolvedPath[PATH_MAX];
+        snprintf(resolvedPath, sizeof(resolvedPath), "%s/%s",
+                 dirname((char *)info.dli_fname), path + 13);
+        result = orig_dlopen(resolvedPath, mode);
+    } else {
+        result = orig_dlopen(path, mode);
+    }
+
+    thread_set_state(thread, ARM_DEBUG_STATE64,
+                     (thread_state_t)&originalDebugState, ARM_DEBUG_STATE64_COUNT);
+    thread_swap_exception_ports(thread, mask, handler, behavior, flavor,
+                                &mask, &masksCount, &handler, &behavior, &flavor);
+    handleLoadedLibrary(path, result);
+    return result;
+}
+
+kern_return_t catch_mach_exception_raise_state(
+    mach_port_t exception_port, exception_type_t exception,
+    const mach_exception_data_t code, mach_msg_type_number_t codeCount,
+    int *flavor, const thread_state_t oldState,
+    mach_msg_type_number_t oldStateCount, thread_state_t newState,
+    mach_msg_type_number_t *newStateCount) {
+    arm_thread_state64_t *old = (arm_thread_state64_t *)oldState;
+    arm_thread_state64_t *new = (arm_thread_state64_t *)newState;
+    uint64_t pc = arm_thread_state64_get_pc(*old);
+
+    for (int i = 0; i < 6 && hwRedirectOrig[i]; i++) {
+        if (pc == hwRedirectOrig[i]) {
+            *new = *old;
+            *newStateCount = oldStateCount;
+            arm_thread_state64_set_pc_fptr(*new, hwRedirectTarget[i]);
+            return KERN_SUCCESS;
+        }
+    }
+    NSLog(@"[DyldLVBypass] Unknown hardware breakpoint at pc: %p", (void *)pc);
+    return KERN_FAILURE;
+}
+
+kern_return_t catch_mach_exception_raise(
+    mach_port_t exceptionPort, mach_port_t thread, mach_port_t task,
+    exception_type_t exception, mach_exception_data_t code,
+    mach_msg_type_number_t codeCount) {
+    abort();
+}
+
+kern_return_t catch_mach_exception_raise_state_identity(
+    mach_port_t exceptionPort, mach_port_t thread, mach_port_t task,
+    exception_type_t exception, mach_exception_data_t code,
+    mach_msg_type_number_t codeCount, int *flavor, thread_state_t oldState,
+    mach_msg_type_number_t oldStateCount, thread_state_t newState,
+    mach_msg_type_number_t *newStateCount) {
+    abort();
+}
+
 
 // ============================================================================
 // Vulkan vertex stride alignment fix（zink + MoltenVK + Mesa 25.0.7）

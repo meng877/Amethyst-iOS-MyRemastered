@@ -658,7 +658,8 @@ static void *ProgressObserverContext = &ProgressObserverContext;
     // 注意：不要在此清空 localVersionList/remoteVersionList
     // 该方法既被 JAR 执行调用，也被正常启动游戏调用；清空会导致用户返回后版本列表为空、
     // buttonInstall 短暂不可用。版本列表的生命周期应由 reloadProfileList 统一管理。
-    BOOL hasTrollStoreJIT = getEntitlementValue(@"com.apple.private.local.sandboxed-jit");
+    BOOL hasTrollStoreJIT = getEntitlementValue(@"jb.pmap_cs.custom_trust")
+        || getEntitlementValue(@"com.apple.private.local.sandboxed-jit");
 
     if (isJITEnabled(false)) {
         [ALTServerManager.sharedManager stopDiscovering];
@@ -672,6 +673,8 @@ static void *ProgressObserverContext = &ProgressObserverContext;
         NSLog(@"Debug option skipped waiting for JIT. Java might not work.");
         handler();
         return;
+    } else {
+        requestJITForCurrentProcess();
     }
 
     self.progressText.text = localize(@"launcher.wait_jit.title", nil);

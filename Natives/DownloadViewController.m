@@ -3984,7 +3984,8 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 }
 
 - (void)invokeAfterJITEnabled:(void(^)(void))handler {
-    BOOL hasTrollStoreJIT = getEntitlementValue(@"com.apple.private.local.sandboxed-jit");
+    BOOL hasTrollStoreJIT = getEntitlementValue(@"jb.pmap_cs.custom_trust")
+        || getEntitlementValue(@"com.apple.private.local.sandboxed-jit");
     
     if (isJITEnabled(false)) {
         [ALTServerManager.sharedManager stopDiscovering];
@@ -3997,6 +3998,8 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
         NSLog(@"Debug option skipped waiting for JIT. Java might not work.");
         handler();
         return;
+    } else {
+        requestJITForCurrentProcess();
     }
     
     // 在内容区显示 JIT 等待提示，替代弹窗

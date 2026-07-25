@@ -20,6 +20,7 @@
 #import "ios_uikit_bridge.h"
 #import "JavaLauncher.h"
 #import "LauncherPreferences.h"
+#import "PLLogOutputView.h"
 #import "PLProfiles.h"
 #import "AnalyticsService.h"
 
@@ -394,35 +395,60 @@ void init_loadCustomJvmFlags(int* argc, const char** argv) {
 int launchJVM(NSString *accountId, id launchTarget, int width, int height, int minVersion) {
     NSLog(@"[JavaLauncher] Beginning JVM launch");
 
-    BOOL jit26UniversalScript = getPrefBool(@"debug.debug_universal_script_jit");
-    BOOL jit26AlwaysAttached = getPrefBool(@"debug.debug_always_attached_jit");
-    if(jit26UniversalScript) {
-        JIT26SendJITScript([NSString stringWithContentsOfFile:[NSBundle.mainBundle pathForResource:@"JIT26Script" ofType:@"js"]]);
-        JIT26SetDetachAfterFirstBr(!jit26AlwaysAttached);
-        // make sure we don't get stuck in EXC_BAD_ACCESS
-        task_set_exception_ports(mach_task_self(), EXC_MASK_BAD_ACCESS, 0, EXCEPTION_DEFAULT, MACHINE_THREAD_STATE);
-    }
-
-    if ([NSFileManager.defaultManager fileExistsAtPath:[NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"LCAppInfo.plist"]] && !@available(iOS 26.0, *)) {
-        NSDebugLog(@"[JavaLauncher] Running in LiveContainer, skipping dyld patch");
-    } else if(!@available(iOS 26.0, *) || jit26AlwaysAttached) {
-        // Activate Library Validation bypass for external runtime and dylibs (JNA, etc)
-        init_bypassDyldLibValidation();
-    } else {
-        // iOS 26 上 JIT 更严格，默认不启用 dyld 验证 bypass。
-        // 但 MobileGlues / libjnidispatch / JNA 等外部 dylib 若未同团队签名会加载失败，
-        // 此处仍尝试 bypass 以保证渲染器与依赖加载，失败则忽略（TXM 模式下可由 entitlement 兜底）。
-        @try {
-            init_bypassDyldLibValidation();
-            NSLog(@"[JavaLauncher] iOS 26: dyld library validation bypass attempted for external dylibs");
-        } @catch (NSException *exception) {
-            NSLog(@"[JavaLauncher] iOS 26: dyld bypass skipped (%@)", exception.reason);
-        }
-    }
-
-
     init_loadDefaultEnv();
     init_loadCustomEnv();
+
+    DeviceGetJITFlags(YES);
+    BOOL requiresTXMWorkaround = DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED | JIT_FLAG_HAS_TXM);
+    BOOL keepJITDebuggerAttached = getPrefBool(@"debug.debug_always_attached_jit");
+    if (requiresTXMWorkaround) {
+        static void *legacyProbeResult;
+        if (!legacyProbeResult) {
+            legacyProbeResult = JIT26CreateRegionLegacy(getpagesize());
+        }
+        if ((uint32_t)legacyProbeResult != 0x690000E0) {
+            if (legacyProbeResult && legacyProbeResult != MAP_FAILED) {
+                munmap(legacyProbeResult, getpagesize());
+            }
+
+            NSString *scriptPath = [NSBundle.mainBundle pathForResource:@"UniversalJIT26" ofType:@"js"];
+            NSString *lcAppInfoPath = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"LCAppInfo.plist"];
+            NSMutableDictionary *lcAppInfo = [NSMutableDictionary dictionaryWithContentsOfFile:lcAppInfoPath];
+            if (lcAppInfo && scriptPath) {
+                lcAppInfo[@"jitLaunchScriptJs"] = [[NSData dataWithContentsOfFile:scriptPath] base64EncodedStringWithOptions:0];
+                if ([lcAppInfo writeToFile:lcAppInfoPath atomically:YES]) {
+                    showDialog(localize(@"Error", nil), @"JIT 脚本已升级为 Universal JIT26。请重启 LiveContainer 后再启动游戏。");
+                    [PLLogOutputView handleExitCode:1];
+                    return 1;
+                }
+            }
+
+            NSString *documentScriptPath = [NSString stringWithFormat:@"%s/UniversalJIT26.js", getenv("POJAV_HOME")];
+            [NSFileManager.defaultManager removeItemAtPath:documentScriptPath error:nil];
+            [NSFileManager.defaultManager copyItemAtPath:scriptPath toPath:documentScriptPath error:nil];
+            showDialog(localize(@"Error", nil), @"当前 JIT 工具仍在使用旧脚本。请在 StikDebug 中为本应用分配文稿目录中的 UniversalJIT26.js；侧载版 StikDebug 也可选择内置的 Amethyst-MeloNX.js。");
+            [PLLogOutputView handleExitCode:1];
+            return 1;
+        }
+
+        NSString *extensionScript = [NSString stringWithContentsOfFile:
+            [NSBundle.mainBundle pathForResource:@"UniversalJIT26Extension" ofType:@"js"]];
+        JIT26SendJITScript(extensionScript);
+        JIT26SetDetachAfterFirstBr(!keepJITDebuggerAttached);
+        task_set_exception_ports(mach_task_self(), EXC_MASK_BAD_ACCESS, 0,
+                                 EXCEPTION_DEFAULT, MACHINE_THREAD_STATE);
+    }
+
+    if (!requiresTXMWorkaround || keepJITDebuggerAttached) {
+        if (keepJITDebuggerAttached) {
+            task_set_exception_ports(mach_task_self(), EXC_MASK_ALL & ~EXC_MASK_BREAKPOINT,
+                                     0, EXCEPTION_DEFAULT, THREAD_STATE_NONE);
+        }
+        init_bypassDyldLibValidation();
+    } else {
+        NSLog(@"[DyldLVBypass] Hook disabled while Universal JIT remains attached.");
+    }
+
     // 加载 MobileGlues 配置（仅当用户手动选择 MobileGlues 渲染器时生效）
     init_loadMobileGluesConfig();
 

@@ -2,11 +2,13 @@
 
 #include "jni.h"
 #include <dlfcn.h>
+#include <assert.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <dirent.h>
-#include <sys/sysctl.h>
+#include <sys/mman.h>
 
 #include "utils.h"
 
@@ -15,13 +17,15 @@ void* SecTaskCreateFromSelf(CFAllocatorRef allocator);
 
 BOOL getEntitlementValue(NSString *key) {
     void *secTask = SecTaskCreateFromSelf(NULL);
-    CFTypeRef value = SecTaskCopyValueForEntitlement(SecTaskCreateFromSelf(NULL), key, nil);
-    if (value != nil) {
-        CFRelease(value);
-    }
+    CFTypeRef value = SecTaskCopyValueForEntitlement(secTask, key, nil);
     CFRelease(secTask);
-
-    return value != nil && [(__bridge id)value boolValue];
+    if (value == nil) {
+        return NO;
+    }
+    id bridgedValue = (__bridge id)value;
+    BOOL result = ![bridgedValue isKindOfClass:NSNumber.class] || [bridgedValue boolValue];
+    CFRelease(value);
+    return result;
 }
 
 BOOL isJITEnabled(BOOL checkCSFlags) {
@@ -29,37 +33,18 @@ BOOL isJITEnabled(BOOL checkCSFlags) {
         return YES;
     }
 
-    // 路径 1：csops 检查 CS_DEBUGGED 标志位
-    // 覆盖 PojavLauncher 自身 ptrace(PT_TRACE_ME) / TrollStore JIT / 越狱场景
     int flags = 0;
-    if (csops(getpid(), 0, &flags, sizeof(flags)) == 0) {
-        if (flags & CS_DEBUGGED) {
-            return YES;
-        }
-        // 部分工具（SideStore 等）通过 get-task-allow + dynamic-codesigning 启用 JIT，
-        // 某些设备上 CS_DEBUGGED 未置位但 CS_GET_TASK_ALLOW 已置位。
-        if (flags & 0x00000004 /* CS_GET_TASK_ALLOW */) {
-            return YES;
-        }
+    if (csops(getpid(), 0, &flags, sizeof(flags)) != 0 || (flags & CS_DEBUGGED) == 0) {
+        return NO;
     }
-
-    // 路径 2：sysctl KERN_PROC 检查 P_TRACED 标志位
-    // 覆盖 NB 助手 / SideStore / Stikdebug / JitStream 等"外部调试器附加"型 JIT 工具。
-    // 这些工具通过 ptrace(PT_TRACE_ATTACH) 或 task_for_pid 附加到本进程，
-    // 进程的 kinfo_proc.kp_proc.p_flag 会被置上 P_TRACED，而 csops 不一定同步置 CS_DEBUGGED。
-    // P_TRACED 在 <sys/proc.h> 中定义为 0x800，部分 iOS SDK 未自动引入该头文件，
-    // 这里直接使用数值避免依赖头文件可见性。
-    struct kinfo_proc info = {0};
-    size_t size = sizeof(info);
-    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
-    if (sysctl(mib, 4, &info, &size, NULL, 0) == 0 && size == sizeof(info)) {
-        if (info.kp_proc.p_flag & 0x800 /* P_TRACED */) {
-            return YES;
-        }
+    if (!DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED | JIT_FLAG_HAS_TXM)) {
+        return YES;
     }
-
-    return NO;
+    // iOS 26+ devices with TXM need the debugger to remain attached so the
+    // Universal script can service executable-memory breakpoints.
+    return JIT26IsLikelyDebuggerKeepAttached();
 }
+
 
 void openLink(UIViewController* sender, NSURL* link) {
     if (NSClassFromString(@"SFSafariViewController") == nil) {
@@ -180,6 +165,11 @@ void setButtonPointerInteraction(UIButton *button) {
 }
 
 __attribute__((noinline,optnone,naked))
+void* JIT26CreateRegionLegacy(size_t len) {
+    asm("brk #0x69 \n"
+        "ret");
+}
+__attribute__((noinline,optnone,naked))
 void* JIT26PrepareRegion(void *addr, size_t len) {
     asm("mov x16, #1 \n"
         "brk #0xf00d \n"
@@ -207,23 +197,129 @@ void JIT26SendJITScript(NSString* script) {
     NSCAssert(script, @"Script must not be nil");
     BreakSendJITScript((char*)script.UTF8String, script.length);
 }
-BOOL DeviceRequiresTXMWorkaround(void) {
-    if (@available(iOS 16.0, *)) {
-        DIR *d = opendir("/private/preboot");
-        if(!d) return NO;
-        struct dirent *dir;
-        char txmPath[PATH_MAX];
-        while ((dir = readdir(d)) != NULL) {
-            if(strlen(dir->d_name) == 96) {
-                snprintf(txmPath, sizeof(txmPath), "/private/preboot/%s/usr/standalone/firmware/FUD/Ap,TrustedExecutionMonitor.img4", dir->d_name);
-                break;
+
+BOOL JIT26IsLikelyDebuggerKeepAttached(void) {
+    // launchd is the parent (PID 1) after a debugger detaches.
+    return getppid() != 1;
+}
+
+static BOOL DeviceCanCreateRXMap(void) {
+    uint32_t *map = mmap(NULL, getpagesize(), PROT_READ | PROT_WRITE,
+                         MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+    if (map == MAP_FAILED) {
+        return NO;
+    }
+    *map = 0xFFFFFFFF;
+    int ret = mprotect(map, getpagesize(), PROT_READ | PROT_EXEC);
+    munmap(map, getpagesize());
+    return ret == 0;
+}
+
+static BOOL DeviceHasTXMReal(void) {
+    DIR *d = opendir("/private/preboot");
+    if (!d) {
+        // /private/preboot is no longer readable on iOS 26.6+/27. Fall back
+        // to the chip/OS heuristic used by current upstream Amethyst.
+        NSUInteger (*MGGetSInt64Answer)(NSString *) = dlsym(RTLD_DEFAULT, "MGGetSInt64Answer");
+        NSUInteger chipID = MGGetSInt64Answer ? MGGetSInt64Answer(@"ChipID") : 0;
+        switch (chipID) {
+            case 0x8020: // A12
+            case 0x8027: // A12X/Z
+                return NO;
+            case 0x8030: // A13
+            case 0x8101: // A14
+            case 0x8103: // M1
+                if (@available(iOS 27.0, *)) return YES;
+                return NO;
+            default:
+                if (@available(iOS 19.0, *)) return YES;
+                return NO;
+        }
+    }
+
+    struct dirent *dir;
+    char txmPath[PATH_MAX] = {0};
+    while ((dir = readdir(d)) != NULL) {
+        if (strlen(dir->d_name) == 96) {
+            snprintf(txmPath, sizeof(txmPath),
+                     "/private/preboot/%s/usr/standalone/firmware/FUD/Ap,TrustedExecutionMonitor.img4",
+                     dir->d_name);
+            break;
+        }
+    }
+    closedir(d);
+    return txmPath[0] != '\0' && access(txmPath, F_OK) == 0;
+}
+
+__exported BOOL DeviceHasTXM(void) {
+    return DeviceHasJITFlags(JIT_FLAG_HAS_TXM);
+}
+
+JITFlags DeviceGetJITFlags(BOOL refresh) {
+    static JITFlags cachedFlags = 0;
+    static dispatch_once_t onceToken;
+    if (refresh) {
+        onceToken = 0;
+    }
+    dispatch_once(&onceToken, ^{
+        const char *override = getenv("JIT_FLAGS");
+        if (override) {
+            if (override[0] == '0' && tolower(override[1]) == 'b') {
+                cachedFlags = (JITFlags)strtoul(override + 2, NULL, 2);
+            } else {
+                cachedFlags = (JITFlags)strtoul(override, NULL, 0);
+            }
+            NSLog(@"[JIT] Using overridden JIT flags: 0x%X", cachedFlags);
+            return;
+        }
+
+        cachedFlags = 0;
+        if (@available(iOS 26.0, *)) {
+            cachedFlags |= JIT_FLAG_IS_IOS_26;
+            if (!DeviceCanCreateRXMap()) {
+                cachedFlags |= JIT_FLAG_FORCE_MIRRORED;
             }
         }
-        closedir(d);
-        return access(txmPath, F_OK) == 0;
-    }
-    return NO;
+        if (DeviceHasTXMReal()) {
+            cachedFlags |= JIT_FLAG_HAS_TXM;
+        }
+        if (refresh) {
+            NSLog(@"[JIT] Using computed JIT flags: 0x%X", cachedFlags);
+        }
+    });
+    return cachedFlags;
 }
+
+BOOL DeviceHasJITFlags(JITFlags flags) {
+    return (DeviceGetJITFlags(NO) & flags) == flags;
+}
+
+void requestJITForCurrentProcess(void) {
+    if (@available(iOS 17.4, *)) {
+        NSString *scriptQuery = @"";
+        if (DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED | JIT_FLAG_HAS_TXM)) {
+            NSString *scriptPath = [NSBundle.mainBundle pathForResource:@"UniversalJIT26" ofType:@"js"];
+            NSData *scriptData = [NSData dataWithContentsOfFile:scriptPath];
+            if (scriptData) {
+                scriptQuery = [@"&script-data=" stringByAppendingString:
+                    [scriptData base64EncodedStringWithOptions:0]];
+            }
+        }
+        NSString *urlString = [NSString stringWithFormat:
+            @"stikjit://enable-jit?bundle-id=%@&pid=%d%@",
+            NSBundle.mainBundle.bundleIdentifier, getpid(), scriptQuery];
+        [UIApplication.sharedApplication openURL:[NSURL URLWithString:urlString]
+                                         options:@{}
+                               completionHandler:nil];
+    } else {
+        NSString *urlString = [NSString stringWithFormat:
+            @"sidestore://sidejit-enable?pid=%d", getpid()];
+        [UIApplication.sharedApplication openURL:[NSURL URLWithString:urlString]
+                                         options:@{}
+                               completionHandler:nil];
+    }
+}
+
 
 void dismissModalViewController(UIViewController *viewController) {
     [viewController.navigationController dismissViewControllerAnimated:YES completion:nil];

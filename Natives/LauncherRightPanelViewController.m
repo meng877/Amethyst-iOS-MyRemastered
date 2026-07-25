@@ -1164,7 +1164,8 @@ static void *ProgressObserverContext = &ProgressObserverContext;
 }
 
 - (void)invokeAfterJITEnabled:(void(^)(void))handler {
-    BOOL hasTrollStoreJIT = getEntitlementValue(@"com.apple.private.local.sandboxed-jit");
+    BOOL hasTrollStoreJIT = getEntitlementValue(@"jb.pmap_cs.custom_trust")
+        || getEntitlementValue(@"com.apple.private.local.sandboxed-jit");
     
     if (isJITEnabled(false)) {
         [ALTServerManager.sharedManager stopDiscovering];
@@ -1177,6 +1178,8 @@ static void *ProgressObserverContext = &ProgressObserverContext;
         NSLog(@"Debug option skipped waiting for JIT. Java might not work.");
         handler();
         return;
+    } else {
+        requestJITForCurrentProcess();
     }
     
     self.progressLabel.text = @"等待 JIT...";
